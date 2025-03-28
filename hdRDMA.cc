@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <fcntl.h>
 
 using std::cout;
 using std::cerr;
@@ -18,6 +19,7 @@ using std::chrono::duration;
 using std::chrono::duration_cast;
 using std::chrono::high_resolution_clock;
 
+extern int VERBOSE;
 extern uint64_t HDRDMA_BUFF_LEN_GB;
 extern uint64_t HDRDMA_NUM_BUFF_SECTIONS;
 
@@ -30,14 +32,14 @@ extern uint64_t HDRDMA_NUM_BUFF_SECTIONS;
 //-------------------------------------------------------------
 hdRDMA::hdRDMA()
 {
-	cout << "Looking for IB devices ..." << endl;
+	if(VERBOSE) cout << "Looking for IB devices ..." << endl;
 	int num_devices = 0;
 	struct ibv_device **devs = ibv_get_device_list( &num_devices );
 	
 	// List devices
-	cout << endl << "=============================================" << endl;
-	cout << "Found " << num_devices << " devices" << endl;
-	cout << "---------------------------------------------" << endl;
+	if(VERBOSE)cout << endl << "=============================================" << endl;
+	if(VERBOSE)cout << "Found " << num_devices << " devices" << endl;
+	if(VERBOSE)cout << "---------------------------------------------" << endl;
 	for(int i=0; i<num_devices; i++){
 	
 		const char *transport_type = "unknown";
@@ -48,9 +50,9 @@ hdRDMA::hdRDMA()
 			case IBV_TRANSPORT_IWARP:
 				transport_type = "IWARP";
 				break;
-			case IBV_EXP_TRANSPORT_SCIF:
-				transport_type = "SCIF";
-				break;
+			// case IBV_TRANSPORT_USNIC:
+			// 	transport_type = "USNIC";
+			// 	break;
 			default:
 				transport_type = "UNKNOWN";
 				break;
@@ -77,15 +79,15 @@ hdRDMA::hdRDMA()
 				Nports++;
 				if( my_port_attr.lid != 0){
 					lid = my_port_attr.lid;
-					dev = devs[i];
+					if( ! dev ) dev = devs[i];
 					this->port_num = port_num;
 				}
 			}
 			ibv_close_device( ctx );
 		}
 		// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-	
-		cout << "   device " << i
+		if(VERBOSE>0){
+			cout << "   device " << i
 			<< " : " << devs[i]->name
 			<< " : " << devs[i]->dev_name
 			<< " : " << transport_type
@@ -95,8 +97,9 @@ hdRDMA::hdRDMA()
 //			<< " : GUID=" << ibv_get_device_guid(devs[i])
 			<< " : lid=" << lid
 			<< endl;
+		}
 	}
-	cout << "=============================================" << endl << endl;
+	if(VERBOSE) cout << "=============================================" << endl << endl;
 	
 	// Open device
 	ctx = ibv_open_device(dev);
@@ -112,21 +115,23 @@ hdRDMA::hdRDMA()
 	ibv_query_port( ctx, port_num, &port_attr);
 	ibv_query_gid(ctx, port_num, index, &gid);
 
-	cout << "Device " << dev->name << " opened."
+	if(VERBOSE>0){
+		cout << "Device " << dev->name << " opened."
 		<< " num_comp_vectors=" << ctx->num_comp_vectors
 		<< endl;
 
-	// Print some of the port attributes
-	cout << "Port attributes:" << endl;
-	cout << "           state: " << port_attr.state << endl;
-	cout << "         max_mtu: " << port_attr.max_mtu << endl;
-	cout << "      active_mtu: " << port_attr.active_mtu << endl;
-	cout << "  port_cap_flags: " << port_attr.port_cap_flags << endl;
-	cout << "      max_msg_sz: " << port_attr.max_msg_sz << endl;
-	cout << "    active_width: " << (uint64_t)port_attr.active_width << endl;
-	cout << "    active_speed: " << (uint64_t)port_attr.active_speed << endl;
-	cout << "      phys_state: " << (uint64_t)port_attr.phys_state << endl;
-	cout << "      link_layer: " << (uint64_t)port_attr.link_layer << endl;
+		// Print some of the port attributes
+		cout << "Port attributes:" << endl;
+		cout << "           state: " << port_attr.state << endl;
+		cout << "         max_mtu: " << port_attr.max_mtu << endl;
+		cout << "      active_mtu: " << port_attr.active_mtu << endl;
+		cout << "  port_cap_flags: " << port_attr.port_cap_flags << endl;
+		cout << "      max_msg_sz: " << port_attr.max_msg_sz << endl;
+		cout << "    active_width: " << (uint64_t)port_attr.active_width << endl;
+		cout << "    active_speed: " << (uint64_t)port_attr.active_speed << endl;
+		cout << "      phys_state: " << (uint64_t)port_attr.phys_state << endl;
+		cout << "      link_layer: " << (uint64_t)port_attr.link_layer << endl;
+	}
 
 	// Allocate protection domain
 	pd = ibv_alloc_pd(ctx);
@@ -162,14 +167,15 @@ hdRDMA::hdRDMA()
 		hdRDMAThread::bufferinfo bi = std::make_tuple( b, buff_section_len );
 		buffer_pool.push_back( bi );
 	}
-	cout << "Created " << buffer_pool.size() << " buffers of " << buff_section_len/1000000 << "MB (" << buff_len/1000000000 << "GB total)" << endl;
+	if(VERBOSE) cout << "Created " << buffer_pool.size() << " buffers of " << buff_section_len/1000000 << "MB (" << buff_len/1000000000 << "GB total)" << endl;
 
 	// Create thread to listen for async ibv events
 	new std::thread( [&](){
+		pthread_setname_np( pthread_self(), "ibv_async_event" );
 		while( !done ){
 			struct ibv_async_event async_event;
 			auto ret = ibv_get_async_event( ctx, &async_event);
-			cout << "+++ RDMA async event: type=" << async_event.event_type << "  ret=" << ret << endl;
+			if(VERBOSE) cout << "+++ RDMA async event: type=" << async_event.event_type << "  ret=" << ret << endl;
 			ibv_ack_async_event( &async_event );
 		}
 	});
@@ -213,8 +219,11 @@ void hdRDMA::Listen(int port)
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	addr.sin_port = htons( port );
-	
+
 	server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	int flags = fcntl( server_sockfd, F_GETFL);
+	fcntl( server_sockfd, F_SETFL, flags | O_NONBLOCK ); // set to non-blocking so program can exit cleanly if prompted
+
 	auto ret = bind( server_sockfd, (struct sockaddr*)&addr, sizeof(addr) );
 	if( ret != 0 ){
 		cout << "ERROR: binding server socket!" << endl;
@@ -225,9 +234,11 @@ void hdRDMA::Listen(int port)
 	// Create separate thread to accept socket connections so we don't block
 	std::atomic<bool> thread_started(false);
 	server_thread = new std::thread([&](){
-		
+
+		pthread_setname_np( pthread_self(), "hdRDMA:Listen" );
+
 		// Loop forever accepting connections
-		cout << "Listening for connections on port ... " << port << endl;
+		if(VERBOSE) cout << "Listening for connections on port ... " << port << endl;
 		thread_started = true;
 		
 		while( !done ){
@@ -235,7 +246,7 @@ void hdRDMA::Listen(int port)
 			struct sockaddr_in peer_addr;
 			socklen_t peer_addr_len = sizeof(struct sockaddr_in);
 			peer_sockfd = accept(server_sockfd, (struct sockaddr *)&peer_addr, &peer_addr_len);
-			if( peer_sockfd > 0 ){
+			if( peer_sockfd >= 0 ){
 //				cout << "Connection from " << inet_ntoa(peer_addr.sin_addr) << endl;
 				
 				// Create a new thread to handle this connection
@@ -246,12 +257,15 @@ void hdRDMA::Listen(int port)
 				Nconnections++;
 
 			}else{
-				cout << "Failed connection!  errno=" << errno <<endl;
-				//break;
+				if( errno == EWOULDBLOCK ){
+					std::this_thread::sleep_for( std::chrono::milliseconds(100) );
+				}else {
+					cout << "Failed connection!  errno=" << errno << endl;
+				}
 			}
 		} // !done
 		
-		cout << "TCP server stopped." << endl;
+		if(VERBOSE) cout << "TCP server stopped." << endl;
 	
 	}); 
 	
@@ -267,7 +281,7 @@ void hdRDMA::Listen(int port)
 void hdRDMA::StopListening(void)
 {
 	if( server_thread ){
-		cout << "Waiting for server to finish ..." << endl;
+		if(VERBOSE) cout << "Waiting for server to finish ..." << endl;
 		done = true;
 		server_thread->join();
 		delete server_thread;
@@ -275,7 +289,7 @@ void hdRDMA::StopListening(void)
 		if( server_sockfd ) close( server_sockfd );
 		server_sockfd = 0;
 	}else{
-		cout << "Server not running." <<endl;
+		if(VERBOSE) cout << "Server not running." <<endl;
 	}
 }
 
@@ -308,7 +322,7 @@ void hdRDMA::Connect(std::string host, int port)
 		}
 		inet_ntop( result->ai_family, ptr, addrstr, 100 );
 		
-		cout << "IP address: " << addrstr << " (" << result->ai_canonname << ")" << endl;
+		if(VERBOSE) cout << "IP address: " << addrstr << " (" << result->ai_canonname << ")" << endl;
 		
 		result = result->ai_next;
 	}
@@ -327,7 +341,7 @@ void hdRDMA::Connect(std::string host, int port)
 		cout << "ERROR: connecting to server: " << host << " (" << inet_ntoa(addr.sin_addr) << ")" << endl;
 		exit(-3);
 	}else{
-		cout << "Connected to " << host << ":" << port << endl;
+		if(VERBOSE) cout << "Connected to " << host << ":" << port << endl;
 	}
 	
 	// Create an hdRDMAThread object to handle the RDMA connection details.
@@ -416,6 +430,7 @@ void hdRDMA::Poll(void)
 			t.first->join();
 			delete t.second;
 			threads.erase( t.first );
+			break; // threads is now modified
 		}
 	}
 

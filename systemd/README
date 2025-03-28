@@ -1,0 +1,23 @@
+
+
+This directory contains files that can be used to run hdrdmacp
+in server mode as a service on systems supporting systemd
+(e.g. RHEL7). To use do the following:
+
+1. Copy hdrdmacp.service and hdrdma.service.d to /etc/systemd/system
+
+2. Either modify the /etc/systemd/system/hdrdmacp.service file
+   to include the full path to the hdrdmacp executable or create
+	a /etc/systemd/system/hdrdma.service.d/environment file that
+	appends to PATH. You may also need to append to LD_LIBRARY_PATH
+
+3. Enable the service by running the following as sudo/root:
+
+      systemctl enable hdrdmacp
+
+
+You can then check the status with "systemctl status hdrdmacp".
+You can also check the log of output with:
+
+  journalctl -u hdrdmacp.service
+

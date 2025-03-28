@@ -1,0 +1,46 @@
+#
+# Run hdrdma in server mode as a service
+#
+# This can be installed on systems supporting systemd (e.g. RHEL7) as:
+#
+#   /etc/systemd/system/hdrdmacp.service
+# 
+#
+# After installing it, the service must be enabled by sudo/root using:
+#
+#  systemctl enable hdrdmacp
+#
+# 
+# The service will run the hdrdmacp executable as found in the PATH.
+# The file pointed to by the EnvironmentFile line below can be used
+# to modify PATH and LD_LIBRARY_PATH (and any other envars).
+#
+#
+# IMPORTANT: You typically want this to create files on the local system
+# as un unpriviliged user. The -u and -g options to hdrdmacp can be used
+# to set these (via calls to setfsuid and setfsgid), The process will still
+# run as root (which is needed for some memory limits)
+#-----------------------------------------------------------------------
+
+# Make this service dependent on the autofs service.
+# This is only for cases when the hdrdmacp program is
+# accessed via network mounted file system.
+#
+[Unit]
+Description=JLab RDMA file transfer server
+Wants=autofs.service
+After=autofs.service
+
+
+[Service]
+# Modify /etc/sysconfig/hdrdmacp file to set PATH and LD_LIBRARY_PATH
+EnvironmentFile=-/etc/sysconfig/hdrdmacp
+ExecStart=/usr/bin/bash -c 'hdrdmacp -s -q -u hdops'
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+
+[Install]
+WantedBy=multi-user.target

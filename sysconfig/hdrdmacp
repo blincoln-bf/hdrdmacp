@@ -1,0 +1,3 @@
+# Set up environment for hdrdmacp service
+
+PATH=/gluex/builds/devel/Linux_RHEL9-x86_64-gcc11/bin:${PATH}

@@ -18,6 +18,11 @@
 
 #include <hdRDMAThread.h>
 
+#ifndef _DBG_
+#define _DBG_ std::cerr<<__FILE__<<":"<<__LINE__<<" "
+#define _DBG__ std::cerr<<__FILE__<<":"<<__LINE__<<"\n"
+#endif // _DBG_
+
 
 class hdRDMA{
 	public:

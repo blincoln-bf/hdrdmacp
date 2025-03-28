@@ -6,22 +6,34 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <pwd.h>
+#include <grp.h>
+#include <sys/fsuid.h>
+#include <iterator>
+#include <mutex>
+#include <set>
 
 #include <zlib.h>
 
 #include "hdRDMA.h"
 
-
-using std::cout;
-using std::cerr;
-using std::endl;
-using std::atomic;
+using namespace std;
 using std::chrono::duration;
 using std::chrono::duration_cast;
 using std::chrono::high_resolution_clock;
 
 extern atomic<uint64_t> BYTES_RECEIVED_TOT;
+extern atomic<uint64_t> NFILES_RECEIVED_TOT;
 extern std::string HDRDMA_REMOTE_ADDR;
+extern int VERBOSE;
+extern int HDRDMA_RET_VAL;
+extern string HDRDMA_USERNAME;
+extern string HDRDMA_GROUPNAME;
+extern std::mutex HDRDMA_RECV_FNAMES_MUTEX;
+extern std::set<string> HDRDMA_RECV_FNAMES;
+
+
+extern string SendControlCommand(string host, string command);
 
 //
 // Some notes on server mode:
@@ -92,6 +104,8 @@ hdRDMAThread::~hdRDMAThread()
 //----------------------------------------------------------------------
 void hdRDMAThread::ThreadRun(int sockfd)
 {
+	pthread_setname_np( pthread_self(), "hdRDMAThread::ThreadRun" );
+
 	// The first thing we send via TCP is a 3 byte message indicating
 	// success or failure. This really just allows us to inform the client
 	// if the server cannot accept another connection right now due to
@@ -148,6 +162,11 @@ void hdRDMAThread::ThreadRun(int sockfd)
 		cerr << e.what() << endl;
 		return;
 	}
+
+	// Set the filesystem UID/GID if specified by the user. This is primarily for when this is
+	// run as root (e.g. as a service) so it can interact with the filesystem as an unpriviliged
+	// user.
+	SetUIDGID();
 	
 	// Loop until we're told to stop by either the master thread or the
 	// remote peer declaring the connection is closing.
@@ -211,6 +230,78 @@ void hdRDMAThread::ThreadRun(int sockfd)
 }
 
 //-------------------------------------------------------------
+// SetUIDGID
+//
+// This is called to (optionally) set the filesystem uid and gid
+// of the process when run in server mode. This is called by
+// each hdRDMAThread since the fsuid and fsgid must be set for
+// each thread.
+//-------------------------------------------------------------
+void hdRDMAThread::SetUIDGID(void)
+{
+	// Note that this calls setfsuid and setfsgid to set the
+	// user and group ids when dealing with the filesystem
+	// ONLY. This feature is here to allow the server to be
+	// started by root, but ensure the creation of files is
+	// done as an unpriviliged user.
+	//
+	// It is worth noting that using seteuid and setreuid were
+	// originally tried here, but would cause problems that
+	// looked very similar to issues when the memorylocked size
+	// was to small. I suspect changing the process IDs caused
+	// that limit to change.
+
+	// Create data structures on stack to use in calls to getgrnam_r
+	// and getpwnam_r. These are used instead of getgrnam and
+	// getpwnam because some problems were seen with files
+	// getting assigned strange uids when multiple files were
+	// being sent to a server simultaneously. I speculate this
+	// was caused by multiple threads simultaneously calling these
+	// which, according to the man page, recycle the same memory.
+	struct passwd pwd;
+	struct passwd *passwd=NULL; // will be set to either NULL or &pwd
+	struct group grp;
+	struct group *group=NULL;  // will be set to either NULL or &grp
+	char buf[8192];
+	size_t buflen = 8192;
+
+	// Set effective gid if specified by user
+	if( HDRDMA_GROUPNAME.length()>0 ){
+		getgrnam_r(HDRDMA_GROUPNAME.c_str(), &grp, buf, buflen, &group);
+		//auto group = getgrnam(HDRDMA_GROUPNAME.c_str());
+		if( !group ){
+			cerr << "Unknown group name \"" << HDRDMA_GROUPNAME << "\"!" << endl;
+			exit(-53);
+		}
+		cout << "Setting fsgid to " << group->gr_gid << " (group=" << group->gr_name << ")" << endl;
+		if( setfsgid(group->gr_gid) != 0 ){
+			perror("setegid() error");
+		}
+	}
+
+	// Set effective uid if specified by user
+	if( HDRDMA_USERNAME.length()>0 ){
+		getpwnam_r(HDRDMA_USERNAME.c_str(), &pwd, buf, buflen, &passwd);
+		//auto passwd = getpwnam(HDRDMA_USERNAME.c_str());
+		if( !passwd ){
+			cerr << "Unknown username \"" << HDRDMA_USERNAME << "\"!" << endl;
+			exit(-52);
+		}
+		if( HDRDMA_GROUPNAME.empty() ){
+			// User did not explicitly set group name so set it to default group
+			if(VERBOSE>1)cout << "Setting fsgid to " << passwd->pw_gid << " (default for user " << passwd->pw_name << ")" << endl;
+			if( setfsgid(passwd->pw_gid) != 0 ){
+				perror("setefsgid() error");
+			}
+		}
+		cout << "Setting fsuid to " << passwd->pw_uid << " (username=" << passwd->pw_name << ")" << endl;
+		if( setfsuid(passwd->pw_uid) != 0 ){
+			perror("setfsuid() error");
+		}
+	}
+}
+
+//-------------------------------------------------------------
 // PostWR
 //
 // Post a receive work request for our QP using the buffer
@@ -237,6 +328,17 @@ void hdRDMAThread::PostWR( int id )
 	auto ret = ibv_post_recv( qp, &wr, &bad_wr);
 	if( ret != 0 ){
 		cout << "ERROR: ibv_post_recv returned non zero value (" << ret << ")" << endl;
+		
+		struct ibv_qp_attr attr;
+		struct ibv_qp_init_attr init_attr;
+		ibv_query_qp(qp, &attr, IBV_QP_STATE, &init_attr);
+		if(attr.qp_state == IBV_QPS_RTR ){
+			cerr << "QP is in RTR state" << endl;
+		}else if(attr.qp_state == IBV_QPS_RTS){
+			cerr << "QP is in RTS state" << endl;
+		}else{
+			cerr << "QP is not in RTR or RTS state (" << attr.qp_state << ")" << endl;
+		}
 	}
 }
 
@@ -257,8 +359,8 @@ void hdRDMAThread::ExchangeQPInfo( int sockfd )
 	// Create a new QP to use with the remote peer. 
 	CreateQP();
 	
-	// Create a work receive request for each MR buffer we have
-	for( uint32_t id=0; id<buffers.size(); id++ ) PostWR( id );
+	// // Create a work receive request for each MR buffer we have
+	// for( uint32_t id=0; id<buffers.size(); id++ ) PostWR( id );
 
 	tmp_qp_info.lid       = htons(qpinfo.lid);
 	tmp_qp_info.qp_num    = htonl(qpinfo.qp_num);
@@ -292,6 +394,8 @@ void hdRDMAThread::ExchangeQPInfo( int sockfd )
 	auto ret = SetToRTS();
 	if( ret != 0 ) cout << "ERROR: Unable to set QP to RTS state!" << endl;
 
+	// Create a work receive request for each MR buffer we have
+	for( uint32_t id=0; id<buffers.size(); id++ ) PostWR( id );
 }
 
 //-------------------------------------------------------------
@@ -350,6 +454,7 @@ int hdRDMAThread::SetToRTS(void)
 	                       IBV_ACCESS_REMOTE_ATOMIC |
 	                       IBV_ACCESS_REMOTE_WRITE;
 
+		if(VERBOSE>1) cout << "Setting QP to init state" << endl;
 		ret = ibv_modify_qp (qp, &qp_attr,
 			 IBV_QP_STATE | IBV_QP_PKEY_INDEX |
 			 IBV_QP_PORT  | IBV_QP_ACCESS_FLAGS);
@@ -373,8 +478,9 @@ int hdRDMAThread::SetToRTS(void)
 		qp_attr.ah_attr.dlid       = remote_qpinfo.lid,
 		qp_attr.ah_attr.sl         = IB_SL,
 		qp_attr.ah_attr.src_path_bits = 0,
-		qp_attr.ah_attr.port_num   = hdrdma->port_num,
+		qp_attr.ah_attr.port_num   = hdrdma->port_num;
 
+		if(VERBOSE>1) cout << "Setting QP to RTR state" << endl;
 		ret = ibv_modify_qp(qp, &qp_attr,
 			    IBV_QP_STATE    | IBV_QP_AV |
 			    IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
@@ -395,8 +501,9 @@ int hdRDMAThread::SetToRTS(void)
 		qp_attr.retry_cnt     = 7,
 		qp_attr.rnr_retry     = 7,
 		qp_attr.sq_psn        = 0,
-		qp_attr.max_rd_atomic = 1,
+		qp_attr.max_rd_atomic = 1;
 
+		if(VERBOSE>1) cout << "Setting QP to RTS state" << endl;
 		ret = ibv_modify_qp (qp, &qp_attr,
 			     IBV_QP_STATE | IBV_QP_TIMEOUT |
 			     IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
@@ -428,16 +535,24 @@ void hdRDMAThread::ReceiveBuffer(uint8_t *buff, uint32_t buff_len)
 				ofs = nullptr;
 			}
 			ofilename = (char*)&hi->payload;
-			cout << "Receiving file: " << ofilename << endl;
-			
+			if(VERBOSE>1)cout << "Receiving file: " << ofilename << endl;
+
 			// Create parent directory path if specified by remote sender
-			cout << "hi->flags: 0x" << std::hex << hi->flags << std::dec << endl;
+			if(VERBOSE>2)cout << "hi->flags: 0x" << std::hex << hi->flags << std::dec << endl;
 			if( hi->flags & HI_MAKE_PARENT_DIRS ){
 				auto pos = ofilename.find_last_of('/');
+				if(VERBOSE>2) cout << "Making directory: " << ofilename.substr(0, pos) << endl;
 				if( pos != std::string::npos ) makePath( ofilename.substr(0, pos) );
 			}
 			
+			if(VERBOSE>2) cout << "Opening output file: " << ofilename << endl;
 			ofs = new std::ofstream( ofilename.c_str() );
+			if( ! ofs->is_open() ){
+				cerr << "Unable to create file: " << ofilename << endl;
+				return;
+			}else if(VERBOSE>2){
+				cout << "Successfully opened output file: " << ofilename << endl;
+			}
 			ofilesize = 0;
 			crcsum = adler32( 0L, Z_NULL, 0 );
 			calculate_checksum = (hi->flags & HI_CALCULATE_CHECKSUM); // optionally calculate checksum
@@ -446,12 +561,17 @@ void hdRDMAThread::ReceiveBuffer(uint8_t *buff, uint32_t buff_len)
 			t_last = t1; // used for intermediate rate calculations
 			delta_t_io = 0.0;
 			Ntransferred = 0;
+
+			// Add filename to list of files currently being received
+			std::lock_guard<mutex> lck(HDRDMA_RECV_FNAMES_MUTEX);
+			HDRDMA_RECV_FNAMES.insert(ofilename);
 		}
 
 		if( !ofs ){
 			cout << "ERROR: Received file buffer with no file open!" << endl;
 			return;
 		}
+		
 		
 		// Write buffer payload to file
 		auto data = &buff[hi->header_len];
@@ -470,13 +590,18 @@ void hdRDMAThread::ReceiveBuffer(uint8_t *buff, uint32_t buff_len)
 			if( t_last != t1 ) cout << endl; // print carriage return if we printed any intermediate progress
 			if( ofs ){
 				auto t_io_start = high_resolution_clock::now();
+				ofs->flush();
 				ofs->close();
+				if(VERBOSE>2) cout << "Closed output file: " << ofilename << endl;
 				auto t_io_end = high_resolution_clock::now();
 				duration<double> duration_io = duration_cast<duration<double>>(t_io_end-t_io_start);
 				delta_t_io += duration_io.count();
-				ofs->close();
 				delete ofs;
 				ofs = nullptr;
+				NFILES_RECEIVED_TOT++;
+
+				std::lock_guard<mutex> lck(HDRDMA_RECV_FNAMES_MUTEX);
+				HDRDMA_RECV_FNAMES.erase(ofilename);
 			}
 //			auto t2 = high_resolution_clock::now();
 //			duration<double> delta_t = duration_cast<duration<double>>(t2-t1);
@@ -597,18 +722,13 @@ void hdRDMAThread::SendFile(std::string srcfilename, std::string dstfilename, bo
 	std::string mess = delete_after_send ? " - will be deleted after send":"";
 	cout << "Sending file: " << srcfilename << "-> (" << HDRDMA_REMOTE_ADDR << ":)" << dstfilename << "   (" << filesize_GB << " GB)" << mess << endl;
 	
-	struct ibv_send_wr wr, *bad_wr = nullptr;
-	struct ibv_sge sge;
-	bzero( &wr, sizeof(wr) );
-	bzero( &sge, sizeof(sge) );
-	
-	wr.opcode = IBV_WR_SEND;
-	wr.sg_list = &sge;
-	wr.num_sge = 1;
-	wr.send_flags = IBV_SEND_SIGNALED,
-	
-	sge.lkey = hdrdma->mr->lkey;
-	
+	// This is not an ideal pattern, but it is a minimal refactoring that ensures
+	// the ibv_send_wr and ibv_sge structs live unchanged for the life of the 
+	// ibv send calls.
+	int max_buffer_sends = 1000;
+	std::vector<struct ibv_send_wr> wr_vec(1000);
+	std::vector<struct ibv_sge> sge_vec(1000);
+
 	// Send buffers
 	crcsum = adler32( 0L, Z_NULL, 0 );
 	t1 = high_resolution_clock::now();
@@ -617,7 +737,22 @@ void hdRDMAThread::SendFile(std::string srcfilename, std::string dstfilename, bo
 	uint64_t bytes_left = filesize;
 	uint32_t Noutstanding_writes = 0;
 	double delta_t_io = 0.0;
-	for(int i=0; i<1000; i++){ // if sending more than 1000 buffers something is wrong!
+	for(int i=0; i<max_buffer_sends; i++){ // if sending more than 1000 buffers something is wrong!
+
+		struct ibv_send_wr &wr=wr_vec[i];
+		struct ibv_send_wr *bad_wr = nullptr;
+		struct ibv_sge &sge=sge_vec[i];
+		bzero( &wr, sizeof(wr) );
+		bzero( &sge, sizeof(sge) );
+		
+		wr.wr_id = i+10;
+		wr.opcode = IBV_WR_SEND;
+		wr.sg_list = &sge;
+		wr.num_sge = 1;
+		wr.send_flags = IBV_SEND_SIGNALED;
+		
+		sge.lkey = hdrdma->mr->lkey;
+	
 		auto id = i%buffers.size();
 		auto &buffer  = buffers[id];
 		auto buff     = std::get<0>(buffer);
@@ -665,10 +800,15 @@ void hdRDMAThread::SendFile(std::string srcfilename, std::string dstfilename, bo
 		// Optionally calculate cehcksum
 		if( calculate_checksum ) crcsum = adler32( crcsum, (uint8_t*)payload_ptr, bytes_payload );
 		
+		// Print optional debugging message
+		if( VERBOSE>1 ){
+			_DBG_ << "\nSending " << sge.length << " bytes (" << bytes_payload << " payload) hi->flags=" << hi->flags << "  wr_id=" << wr.wr_id << std::endl;
+		}
+
 		// Post write
 		auto ret = ibv_post_send( qp, &wr, &bad_wr );
 		if( ret != 0 ){
-			cout << "ERROR: ibv_post_send returned non zero value (" << ret << ")" << endl;
+			_DBG_ << "ERROR: ibv_post_send returned non zero value (" << ret << ")" << endl;
 			break;
 		}
 		Noutstanding_writes++;
@@ -686,7 +826,12 @@ void hdRDMAThread::SendFile(std::string srcfilename, std::string dstfilename, bo
 
 		// If we've posted data using all available sections of the mr
 		// then we need to wait for one to finish so we can recycle it.
-		if( Noutstanding_writes>=buffers.size() ){
+		if(VERBOSE>1) _DBG_ << "Noutstanding_writes="<<Noutstanding_writes<< " buffers.size()=" << buffers.size() <<"\n";
+		// n.b. The original design allowed multiple buffers to be scheduled at the same time.
+		// However, this causes errors on the RHEL9.5 on gluonraid7. Thus, this now polls and
+		// waits for every buffer to complete before sending the next.
+		// if( Noutstanding_writes>=buffers.size() ){
+		if( Noutstanding_writes>=1 ){
 			PollCQ();
 			Noutstanding_writes--;
 		}
@@ -720,9 +865,24 @@ void hdRDMAThread::SendFile(std::string srcfilename, std::string dstfilename, bo
 	if( calculate_checksum ) cout << "  checksum: " << std::hex << crcsum << std::dec << endl;
 	//cout << "  IB rate sending file: " << delta_t.count()-delta_t_io << " sec  (" << rate_ib_Gbps << " Gbps) - n.b. don't take this seriously!" << endl;
 
-	if( delete_after_send ){
-		unlink( srcfilename.c_str() );
-		cout <<"  Deleted src file: " << srcfilename << endl;
+	// Verify file was completely sent by checking file size on remote host
+	string response = SendControlCommand( HDRDMA_REMOTE_ADDR, string("get_file_size ") + dstfilename);
+//	cout << "response: " << response << endl;
+	std::vector<string> vals;
+	std::istringstream iss( response );
+	copy( std::istream_iterator<string>(iss), std::istream_iterator<string>(), back_inserter(vals) );
+	int64_t fsize = 0;
+	if( vals.size()>1 ) fsize = atoll( vals[1].c_str() );
+	if( fsize == filesize ){
+		cout << "  Confirmed remote file size matches local: " << fsize << " bytes" << endl;
+		if( delete_after_send ) {
+			unlink(srcfilename.c_str());
+			cout << "  Deleted src file: " << srcfilename << endl;
+		}
+	}else{
+		cerr << "Local and remote file sizes do not match after send! (" << filesize << " != " << fsize << ")" << endl;
+		cerr << "response from server was: " << response << endl;
+		HDRDMA_RET_VAL = -1;
 	}
 }
 
@@ -743,6 +903,7 @@ void hdRDMAThread::PollCQ(void)
 	
 		// Check to see if a work completion notification has come in
 		int n = ibv_poll_cq(cq, num_wc, &wc);
+		if( VERBOSE>1) _DBG_ << "polled completion queue. ibv_poll_cq() result: n= " << n << "  wc.wr_id=" << wc.wr_id <<"\n";
 		if( n<0 ){
 			std::stringstream ss;
 			ss << "ERROR: ibv_poll_cq returned " << n << " - closing connection";
@@ -751,7 +912,25 @@ void hdRDMAThread::PollCQ(void)
 		if( n == 0 ){
 			std::this_thread::sleep_for(std::chrono::microseconds(1));
 			continue;
-		} 
+		}
+
+		// If we get here then n should equal 1
+		if( VERBOSE>1){
+
+			_DBG_ << "wc.status=" << wc.status << " (IBV_WC_WR_FLUSH_ERR=" << IBV_WC_WR_FLUSH_ERR << ")\n";
+
+			struct ibv_qp_attr attr;
+			struct ibv_qp_init_attr init_attr;
+			int ret = ibv_query_qp(qp, &attr, IBV_QP_STATE, &init_attr);
+			if(ret) {
+				perror("ibv_query_qp");
+			} else {
+				std::cout << "Current QP state: " << attr.qp_state << std::endl;
+				if(attr.qp_state != IBV_QPS_RTS) {
+					std::cerr << "QP is not in RTS state("<<IBV_QPS_RTS<<"); it may be in error state." << std::endl;
+				}
+			}
+		}	
 		
 		break;
 	}
