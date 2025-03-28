@@ -131,7 +131,15 @@ Note: In the options below:
     -cmd host "command arg ..." send command to specified host
 
  (run with --help for extended help)
+
 </pre>
+
+## Notes
+
+1. The full filename on the destination must be specfied, not just a directory. This is not checked for automatically so the user must take care.
+2. The remote host and port refer to a TCP connection that is first made to exchange the RDMA connection info. The file is then transferred via RDMA.
+3. The destination port may be speficied either via the -p option or as part of the destination argument. e.g. my.remote.host:12345:/path/to/my/destfilename if both are given then the one given in the destination argument is used.
+4. Transfers will fail if the destination directory does not already exist on the remote host. If you add the -P argument then the destination directory will be automatically created (if it doesn't already exist).
 
 ## Example
 
